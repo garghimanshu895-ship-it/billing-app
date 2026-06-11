@@ -1,75 +1,18 @@
 import streamlit as st
 import pandas as pd
-from io import BytesIO
 
-st.set_page_config(page_title="Billing Software", layout="wide")
+from utils.billing_logic import fill_target_fast, combine_items
+from utils.file_handler import read_excel_safe, to_excel
+from utils.validation import validate_columns, validate_positive, validate_not_empty
+
+st.set_page_config(page_title="Billing System", layout="wide")
+
+st.sidebar.title("📊 Smart Controls")
+st.sidebar.info("Generate and update bills easily")
+
 st.title("🧾 Smart Billing & Stock Management System")
 
-# -----------------------------
-# EXCEL DOWNLOAD FUNCTION
-# -----------------------------
-def to_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    return output.getvalue()
-
-# -----------------------------
-# FAST FILL FUNCTION
-# -----------------------------
-def fill_target_fast(stock_df, target):
-    stock_df = stock_df.sort_values(by="PRICE", ascending=False)
-
-    selected = []
-    achieved = 0
-
-    for i, row in stock_df.iterrows():
-        price = int(row["PRICE"])
-        qty = int(row["QTY"])
-
-        while qty > 0 and achieved + price <= target:
-            selected.append({
-                "ITEM NAME": row["ITEM NAME"],
-                "PRICE": price,
-                "INDEX": i
-            })
-            achieved += price
-            qty -= 1
-
-        if achieved == target:
-            break
-
-    return selected, achieved
-
-# -----------------------------
-# COMBINE ITEMS
-# -----------------------------
-def combine_items(selected):
-    combined = {}
-
-    for item in selected:
-        key = (item["ITEM NAME"], item["PRICE"])
-
-        if key not in combined:
-            combined[key] = {
-                "ITEM NAME": item["ITEM NAME"],
-                "PRICE": item["PRICE"],
-                "QUANTITY": 0
-            }
-
-        combined[key]["QUANTITY"] += 1
-
-    result = []
-    for v in combined.values():
-        v["AMOUNT"] = v["QUANTITY"] * v["PRICE"]
-        result.append(v)
-
-    return result
-
-# -----------------------------
-# UI TABS
-# -----------------------------
-tab1, tab2 = st.tabs(["📄 Generate Bills", "🔄 Update Items & Regenerate"])
+tab1, tab2 = st.tabs(["📄 Generate Bills", "🔄 Update Items"])
 
 # =========================================================
 # TAB 1: GENERATE BILLS
@@ -78,86 +21,184 @@ with tab1:
 
     st.header("📄 Generate Bills")
 
-    bill_no = st.number_input("Starting Bill Number", min_value=1, value=1)
-    bills_file = st.file_uploader("Upload Bills File", type=["xlsx"], key="bills")
-    stock_file = st.file_uploader("Upload Stock File", type=["xlsx"], key="stock")
+    bills_file = st.file_uploader("Upload Bills File", type=["xlsx"], key="bills_tab1")
+    stock_file = st.file_uploader("Upload Stock File", type=["xlsx"], key="stock_tab1")
+
+    if "bills_generated" not in st.session_state:
+        st.session_state["bills_generated"] = False
 
     if st.button("🚀 Generate Bills"):
 
-        if bills_file and stock_file:
-
-            bills = pd.read_excel(bills_file)
-            stock = pd.read_excel(stock_file)
-
-            bills.columns = bills.columns.str.strip().str.upper()
-            stock.columns = stock.columns.str.strip().str.upper()
-
-            stock["QTY"] = stock["QTY"].astype(float)
-            stock["PRICE"] = stock["PRICE"].astype(float)
-
-            output = []
-
-            for _, bill in bills.iterrows():
-
-                date = pd.to_datetime(bill["DATE"]).strftime("%d-%m-%Y")
-                remaining = int(round(float(bill["AMOUNT"])))
-                original_total = remaining
-
-                used_rows = []
-
-                # FILL LOGIC
-                selected, achieved = fill_target_fast(stock, remaining)
-
-                # UPDATE STOCK
-                for item in selected:
-                    stock.at[item["INDEX"], "QTY"] -= 1
-
-                # COMBINE
-                combined_items = combine_items(selected)
-
-                for item in combined_items:
-                    output.append({
-                        "DATE": date,
-                        "BILL NO": bill_no,
-                        "ITEM NAME": item["ITEM NAME"],
-                        "QUANTITY": item["QUANTITY"],
-                        "PRICE": item["PRICE"],
-                        "AMOUNT": item["AMOUNT"]
-                    })
-
-                if achieved != original_total:
-                    output.append({
-                        "DATE": date,
-                        "BILL NO": bill_no,
-                        "ITEM NAME": "UNMATCHED",
-                        "QUANTITY": "",
-                        "PRICE": "",
-                        "AMOUNT": original_total - achieved
-                    })
-
-                output.append({"DATE":"","BILL NO":"","ITEM NAME":"","QUANTITY":"","PRICE":"","AMOUNT":""})
-                bill_no += 1
-
-            output_df = pd.DataFrame(output)
-            remaining_stock = stock[stock["QTY"] > 0]
-
-            st.success("✅ Bills Generated!")
-
-            st.download_button("📥 Download Output", to_excel(output_df), "output.xlsx")
-            st.download_button("📥 Download Remaining Stock", to_excel(remaining_stock), "remaining_stock.xlsx")
-
-        else:
+        if not bills_file or not stock_file:
             st.error("Upload both files")
+            st.stop()
+
+        bills = read_excel_safe(bills_file)
+        stock = read_excel_safe(stock_file)
+
+        # =========================
+        # VALIDATION
+        # =========================
+        validate_columns(bills, ["DATE", "AMOUNT", "BILL NO", "PARTICULAR"])
+        validate_columns(stock, ["ITEM NAME", "PRICE", "QTY"])
+
+        # =========================
+        # CLEAN DATA (IMPORTANT FIX)
+        # =========================
+        bills["AMOUNT"] = pd.to_numeric(bills["AMOUNT"], errors="coerce").fillna(0)
+
+        stock["QTY"] = pd.to_numeric(stock["QTY"], errors="coerce").fillna(0)
+        stock["PRICE"] = pd.to_numeric(stock["PRICE"], errors="coerce").fillna(0)
+
+        if "BILL NO" not in bills.columns:
+            st.warning("BILL NO not found, auto-generating...")
+            bills["BILL NO"] = range(1, len(bills) + 1)
+
+        if bills["BILL NO"].duplicated().any():
+            st.error("Duplicate BILL NO found!")
+            st.stop()
+
+        output = []
+        progress = st.progress(0)
+
+        for idx, bill in bills.iterrows():
+
+            date = pd.to_datetime(bill["DATE"]).strftime("%d-%m-%Y")
+
+            # ✅ SAFE AMOUNT (NO NaN CRASH EVER)
+            total = int(round(bill["AMOUNT"]))
+
+            bill_no = bill["BILL NO"]
+            particular = bill.get("PARTICULAR", "")
+
+            selected, achieved = fill_target_fast(stock, total)
+
+            for item in selected:
+                stock.at[item["INDEX"], "QTY"] -= 1
+
+            combined = combine_items(selected)
+
+            for item in combined:
+                output.append({
+                    "DATE": date,
+                    "BILL NO": bill_no,
+                    "PARTICULAR": particular,
+                    "ITEM NAME": item["ITEM NAME"],
+                    "QUANTITY": item["QUANTITY"],
+                    "PRICE": item["PRICE"],
+                    "AMOUNT": item["AMOUNT"]
+                })
+
+            if achieved != total:
+                output.append({
+                    "DATE": date,
+                    "BILL NO": bill_no,
+                    "PARTICULAR": particular,
+                    "ITEM NAME": "UNMATCHED",
+                    "QUANTITY": "",
+                    "PRICE": "",
+                    "AMOUNT": total - achieved
+                })
+
+            output.append({})
+            progress.progress((idx + 1) / len(bills))
+
+        output_df = pd.DataFrame(output)
+
+        output_df["AMOUNT"] = pd.to_numeric(output_df["AMOUNT"], errors="coerce").fillna(0)
+
+        # ACCOUNT CLASSIFICATION
+        output_df["ACCOUNT_TYPE"] = output_df["PARTICULAR"].apply(
+            lambda x: "Cash" if "CASH" in str(x).upper()
+            else "Sundry Debtors" if "DEBTOR" in str(x).upper() or "SUNDRY" in str(x).upper()
+            else "Other"
+        )
+
+        remaining_stock = stock[stock["QTY"] > 0]
+
+        st.session_state["output_df"] = output_df
+        st.session_state["remaining_stock"] = remaining_stock
+        st.session_state["bills_generated"] = True
+
+    # =========================
+    # DASHBOARD
+    # =========================
+    if st.session_state["bills_generated"]:
+
+        st.success("✅ Bills Generated Successfully")
+
+        output_df = st.session_state["output_df"]
+        remaining_stock = st.session_state["remaining_stock"]
+
+        st.markdown("## 📊 Dashboard Overview")
+
+        clean_df = output_df.copy()
+        clean_df["AMOUNT"] = pd.to_numeric(clean_df["AMOUNT"], errors="coerce").fillna(0)
+        clean_df["QUANTITY"] = pd.to_numeric(clean_df["QUANTITY"], errors="coerce").fillna(0)
+
+        total_revenue = int(clean_df["AMOUNT"].sum())
+        total_items = int(clean_df["QUANTITY"].sum())
+        total_bills = clean_df["BILL NO"].nunique()
+        remaining_items = int(remaining_stock["QTY"].sum())
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric("💰 Total Revenue", f"₹ {total_revenue}")
+        col2.metric("🧾 Total Bills", total_bills)
+        col3.metric("📦 Items Sold", total_items)
+        col4.metric("🏪 Remaining Stock", remaining_items)
+
+        st.markdown("---")
+
+        st.subheader("📄 Generated Bills")
+        st.dataframe(output_df, use_container_width=True)
+
+        st.download_button(
+            "📥 Download Bills",
+            to_excel(output_df),
+            "output.xlsx"
+        )
+
+        st.markdown("---")
+
+        st.subheader("📦 Remaining Stock")
+        st.dataframe(remaining_stock, use_container_width=True)
+
+        st.download_button(
+            "📥 Download Stock",
+            to_excel(remaining_stock),
+            "remaining_stock.xlsx"
+        )
 
 # =========================================================
 # TAB 2: UPDATE ITEMS
 # =========================================================
 with tab2:
 
-    st.header("🔄 Update & Regenerate Bills")
+    st.header("🔄 Update Items & Regenerate")
 
-    output_file = st.file_uploader("Upload Output File", type=["xlsx"], key="output")
-    stock_file2 = st.file_uploader("Upload Remaining Stock", type=["xlsx"], key="stock2")
+    use_generated = st.checkbox("Use generated data from Tab 1")
+
+    if use_generated:
+        if "output_df" in st.session_state:
+            output_df = st.session_state["output_df"]
+            stock_df = st.session_state["remaining_stock"]
+            st.success("Using generated data ✅")
+        else:
+            st.error("Generate bills first")
+            st.stop()
+    else:
+        output_file = st.file_uploader("Upload Output File", type=["xlsx"], key="output_tab2")
+        stock_file2 = st.file_uploader("Upload Stock File", type=["xlsx"], key="stock_tab2")
+
+        if not output_file or not stock_file2:
+            st.warning("Upload both files")
+            st.stop()
+
+        output_df = read_excel_safe(output_file)
+        stock_df = read_excel_safe(stock_file2)
+
+    output_df["AMOUNT"] = pd.to_numeric(output_df["AMOUNT"], errors="coerce").fillna(0)
 
     item_name = st.text_input("Item Name").strip().upper()
     old_price = st.number_input("Old Price", value=0.0)
@@ -165,106 +206,85 @@ with tab2:
 
     if st.button("🔄 Update & Regenerate"):
 
-        if output_file and stock_file2:
+        validate_not_empty(item_name, "Item Name")
+        validate_positive(old_price, "Old Price")
+        validate_positive(new_price, "New Price")
 
-            output_df = pd.read_excel(output_file)
-            stock_df = pd.read_excel(stock_file2)
+        final_output = []
 
-            output_df.columns = output_df.columns.str.strip().str.upper()
-            stock_df.columns = stock_df.columns.str.strip().str.upper()
+        for bill_no, group in output_df.groupby("BILL NO"):
 
-            output_df["ITEM NAME"] = output_df["ITEM NAME"].astype(str).str.upper()
-            stock_df["ITEM NAME"] = stock_df["ITEM NAME"].astype(str).str.upper()
+            group = group.dropna(subset=["ITEM NAME"])
+            if group.empty:
+                continue
 
-            stock_df["PRICE"] = stock_df["PRICE"].astype(float)
-            stock_df["QTY"] = stock_df["QTY"].astype(float)
+            date = group.iloc[0]["DATE"]
+            particular = group.iloc[0].get("PARTICULAR", "")
+            original_total = int(group["AMOUNT"].sum())
 
-            final_output = []
+            remaining_items = []
 
-            for bill_no, group in output_df.groupby("BILL NO"):
+            for _, row in group.iterrows():
 
-                group = group.dropna(subset=["ITEM NAME"])
-                if group.empty:
-                    continue
+                if row["ITEM NAME"] == item_name and float(row["PRICE"]) == old_price:
+                    stock_df.loc[len(stock_df)] = {
+                        "ITEM NAME": item_name,
+                        "QTY": float(row.get("QUANTITY", 0)),
+                        "PRICE": new_price
+                    }
+                else:
+                    remaining_items.append(row)
 
-                date = group.iloc[0]["DATE"]
-                original_total = int(group["AMOUNT"].sum())
-
-                remaining_items = []
-
-                # REMOVE OLD ITEM
-                for _, row in group.iterrows():
-
-                    if row["ITEM NAME"] == item_name and float(row["PRICE"]) == old_price:
-                        qty = float(row["QUANTITY"])
-
-                        stock_df.loc[len(stock_df)] = {
-                            "ITEM NAME": item_name,
-                            "QTY": qty,
-                            "PRICE": new_price,
-                            "UNIT": "PCS"
-                        }
-                    else:
-                        remaining_items.append(row)
-
-                # CALCULATE REMAINING
-                current_total = sum([int(r["AMOUNT"]) for r in remaining_items])
-                remaining_target = original_total - current_total
-
-                # SAVE OLD ITEMS
-                for r in remaining_items:
-                    final_output.append(r.to_dict())
-
-                # REFILL
-                if remaining_target > 0:
-
-                    selected, achieved = fill_target_fast(stock_df, remaining_target)
-
-                    for item in selected:
-                        stock_df.at[item["INDEX"], "QTY"] -= 1
-
-                    combined_items = combine_items(selected)
-
-                    for item in combined_items:
-                        final_output.append({
-                            "DATE": date,
-                            "BILL NO": bill_no,
-                            "ITEM NAME": item["ITEM NAME"],
-                            "QUANTITY": item["QUANTITY"],
-                            "PRICE": item["PRICE"],
-                            "AMOUNT": item["AMOUNT"]
-                        })
-
-                    if achieved != remaining_target:
-                        final_output.append({
-                            "DATE": date,
-                            "BILL NO": bill_no,
-                            "ITEM NAME": "NOT EXACT MATCH",
-                            "QUANTITY": "",
-                            "PRICE": "",
-                            "AMOUNT": remaining_target - achieved
-                        })
-
-                final_output.append({"DATE":"","BILL NO":"","ITEM NAME":"","QUANTITY":"","PRICE":"","AMOUNT":""})
-
-            final_df = pd.DataFrame(final_output)
-
-            st.success("✅ Updated Successfully!")
-
-            # REMOVE ZERO QTY ITEMS
-            updated_stock = stock_df[stock_df["QTY"] > 0]
-            
-            st.download_button(
-                "📥 Download Updated Output",
-                to_excel(final_df),
-                "final_output.xlsx"
-            )
-            
-            st.download_button(
-                "📦 Download Updated Stock",
-                to_excel(updated_stock),
-                "updated_stock.xlsx"
+            current_total = sum(
+                int(r["AMOUNT"]) for r in remaining_items if str(r["AMOUNT"]).strip() != ""
             )
 
-        else:
-            st.error("Upload both files")
+            remaining_target = original_total - current_total
+
+            for r in remaining_items:
+                final_output.append(r.to_dict())
+
+            if remaining_target > 0:
+
+                selected, achieved = fill_target_fast(stock_df, remaining_target)
+
+                for item in selected:
+                    stock_df.at[item["INDEX"], "QTY"] -= 1
+
+                combined = combine_items(selected)
+
+                for item in combined:
+                    final_output.append({
+                        "DATE": date,
+                        "BILL NO": bill_no,
+                        "PARTICULAR": particular,
+                        "ITEM NAME": item["ITEM NAME"],
+                        "QUANTITY": item["QUANTITY"],
+                        "PRICE": item["PRICE"],
+                        "AMOUNT": item["AMOUNT"]
+                    })
+
+                if achieved != remaining_target:
+                    final_output.append({
+                        "DATE": date,
+                        "BILL NO": bill_no,
+                        "PARTICULAR": particular,
+                        "ITEM NAME": "NOT EXACT MATCH",
+                        "QUANTITY": "",
+                        "PRICE": "",
+                        "AMOUNT": remaining_target - achieved
+                    })
+
+            final_output.append({})
+
+        final_df = pd.DataFrame(final_output)
+
+        st.success("✅ Updated Successfully")
+
+        st.dataframe(final_df, use_container_width=True)
+
+        st.download_button(
+            "📥 Download Updated File",
+            to_excel(final_df),
+            "updated.xlsx"
+        )
