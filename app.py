@@ -36,15 +36,11 @@ with tab1:
         bills = read_excel_safe(bills_file)
         stock = read_excel_safe(stock_file)
 
-        # =========================
         # VALIDATION
-        # =========================
         validate_columns(bills, ["DATE", "AMOUNT", "BILL NO", "PARTICULAR"])
         validate_columns(stock, ["ITEM NAME", "PRICE", "QTY"])
 
-        # =========================
-        # CLEAN DATA (IMPORTANT FIX)
-        # =========================
+        # CLEAN DATA
         bills["AMOUNT"] = pd.to_numeric(bills["AMOUNT"], errors="coerce").fillna(0)
 
         stock["QTY"] = pd.to_numeric(stock["QTY"], errors="coerce").fillna(0)
@@ -64,10 +60,7 @@ with tab1:
         for idx, bill in bills.iterrows():
 
             date = pd.to_datetime(bill["DATE"]).strftime("%d-%m-%Y")
-
-            # ✅ SAFE AMOUNT (NO NaN CRASH EVER)
             total = int(round(bill["AMOUNT"]))
-
             bill_no = bill["BILL NO"]
             particular = bill.get("PARTICULAR", "")
 
@@ -104,10 +97,9 @@ with tab1:
             progress.progress((idx + 1) / len(bills))
 
         output_df = pd.DataFrame(output)
-
         output_df["AMOUNT"] = pd.to_numeric(output_df["AMOUNT"], errors="coerce").fillna(0)
 
-        # ACCOUNT CLASSIFICATION
+        # ACCOUNT TYPE
         output_df["ACCOUNT_TYPE"] = output_df["PARTICULAR"].apply(
             lambda x: "Cash" if "CASH" in str(x).upper()
             else "Sundry Debtors" if "DEBTOR" in str(x).upper() or "SUNDRY" in str(x).upper()
@@ -120,9 +112,7 @@ with tab1:
         st.session_state["remaining_stock"] = remaining_stock
         st.session_state["bills_generated"] = True
 
-    # =========================
     # DASHBOARD
-    # =========================
     if st.session_state["bills_generated"]:
 
         st.success("✅ Bills Generated Successfully")
@@ -130,48 +120,28 @@ with tab1:
         output_df = st.session_state["output_df"]
         remaining_stock = st.session_state["remaining_stock"]
 
-        st.markdown("## 📊 Dashboard Overview")
+        st.subheader("📊 Dashboard")
 
         clean_df = output_df.copy()
         clean_df["AMOUNT"] = pd.to_numeric(clean_df["AMOUNT"], errors="coerce").fillna(0)
         clean_df["QUANTITY"] = pd.to_numeric(clean_df["QUANTITY"], errors="coerce").fillna(0)
 
-        total_revenue = int(clean_df["AMOUNT"].sum())
-        total_items = int(clean_df["QUANTITY"].sum())
-        total_bills = clean_df["BILL NO"].nunique()
-        remaining_items = int(remaining_stock["QTY"].sum())
-
         col1, col2, col3, col4 = st.columns(4)
 
-        col1.metric("💰 Total Revenue", f"₹ {total_revenue}")
-        col2.metric("🧾 Total Bills", total_bills)
-        col3.metric("📦 Items Sold", total_items)
-        col4.metric("🏪 Remaining Stock", remaining_items)
+        col1.metric("Revenue", f"₹ {int(clean_df['AMOUNT'].sum())}")
+        col2.metric("Bills", clean_df["BILL NO"].nunique())
+        col3.metric("Items", int(clean_df["QUANTITY"].sum()))
+        col4.metric("Stock Left", int(remaining_stock["QTY"].sum()))
 
-        st.markdown("---")
+        st.dataframe(output_df)
+        st.dataframe(remaining_stock)
 
-        st.subheader("📄 Generated Bills")
-        st.dataframe(output_df, use_container_width=True)
+        st.download_button("Download Bills", to_excel(output_df), "output.xlsx")
+        st.download_button("Download Stock", to_excel(remaining_stock), "stock.xlsx")
 
-        st.download_button(
-            "📥 Download Bills",
-            to_excel(output_df),
-            "output.xlsx"
-        )
-
-        st.markdown("---")
-
-        st.subheader("📦 Remaining Stock")
-        st.dataframe(remaining_stock, use_container_width=True)
-
-        st.download_button(
-            "📥 Download Stock",
-            to_excel(remaining_stock),
-            "remaining_stock.xlsx"
-        )
 
 # =========================================================
-# TAB 2: UPDATE ITEMS
+# TAB 2: UPDATE ITEMS (FIXED LOGIC)
 # =========================================================
 with tab2:
 
@@ -183,7 +153,7 @@ with tab2:
         if "output_df" in st.session_state:
             output_df = st.session_state["output_df"]
             stock_df = st.session_state["remaining_stock"]
-            st.success("Using generated data ✅")
+            st.success("Using generated data")
         else:
             st.error("Generate bills first")
             st.stop()
@@ -226,12 +196,17 @@ with tab2:
 
             for _, row in group.iterrows():
 
-                if row["ITEM NAME"] == item_name and float(row["PRICE"]) == old_price:
+                # ✅ FIXED FLOAT COMPARISON (IMPORTANT FIX)
+                if (
+                    row["ITEM NAME"] == item_name
+                    and abs(float(row["PRICE"]) - old_price) < 0.01
+                ):
                     stock_df.loc[len(stock_df)] = {
                         "ITEM NAME": item_name,
                         "QTY": float(row.get("QUANTITY", 0)),
-                        "PRICE": new_price
+                        "PRICE": float(new_price)
                     }
+
                 else:
                     remaining_items.append(row)
 
@@ -281,7 +256,7 @@ with tab2:
 
         st.success("✅ Updated Successfully")
 
-        st.dataframe(final_df, use_container_width=True)
+        st.dataframe(final_df)
 
         st.download_button(
             "📥 Download Updated File",
